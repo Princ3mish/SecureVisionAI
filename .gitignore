@@ -15,17 +15,13 @@ build/
 *.env
 
 # Node / Frontend
-web/node_modules/
-web/dist/
-web/moment-seek.zip
+frontend/node_modules/
+frontend/dist/
+web/
 
 # Runtime data files (generated at runtime)
-data/video.*
-data/audio.*
-data/frames/
-data/index.faiss
-data/documents.json
-data/*.json
+data/
+backend/data/
 
 # Common video/audio formats
 *.mp4
