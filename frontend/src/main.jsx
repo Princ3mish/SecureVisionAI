@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye } from 'lucide-react'
 import './styles.css'
 
-const API = 'http://localhost:8000'
+const API = 'http://127.0.0.1:8000'
 const formatTime = (seconds) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${(seconds % 60).toFixed(1).padStart(4, '0')}`
 
 export default function App() {
