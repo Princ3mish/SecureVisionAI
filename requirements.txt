@@ -1,0 +1,13 @@
+yt-dlp
+numpy
+opencv-python
+openai-whisper
+transformers
+sentence-transformers
+faiss-cpu
+torch
+torchvision
+Pillow
+fastapi
+uvicorn[standard]
+python-multipart
