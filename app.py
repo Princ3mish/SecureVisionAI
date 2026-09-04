@@ -95,7 +95,7 @@ def extract_frames(video: Path, frame_dir: Path, interval: float) -> list[dict]:
         ffmpeg_exe, "-y", "-i", str(video), "-vf", f"fps=1/{interval}",
         "-q:v", "2", str(frame_dir / "frame_%06d.jpg"),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True)
+    completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if completed.returncode:
         raise RuntimeError(f"FFmpeg frame extraction failed:\n{completed.stderr[-2000:]}")
     files = sorted(frame_dir.glob("frame_*.jpg"))
