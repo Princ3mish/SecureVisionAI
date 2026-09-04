@@ -19,6 +19,7 @@ export default function App() {
   const [isIndexed, setIsIndexed] = useState(false)
   const [activeMoment, setActiveMoment] = useState(null)
   const [currentTime, setCurrentTime] = useState(0)
+  const [videoVersion, setVideoVersion] = useState(Date.now())
 
   // Navigation state: 'landing' | 'upload' | 'studio'
   const [currentView, setCurrentView] = useState('landing')
@@ -35,6 +36,7 @@ export default function App() {
           const data = await res.json()
           if (data.ready && data.video) {
             setIsIndexed(true)
+            setVideoVersion(Date.now())
             setCurrentView('studio')
             setMessage('Existing index loaded and ready to search.')
           }
@@ -91,6 +93,7 @@ export default function App() {
             clearInterval(poll)
             setStats(task.result)
             setIsIndexed(true)
+            setVideoVersion(Date.now())
             setCurrentView('studio')
             setMessage(`Index ready · ${task.result.frames} frames · ${task.result.segments} transcript segments · ${task.result.device}`)
             setBusy(false)
@@ -378,7 +381,7 @@ export default function App() {
             <div className="video-container">
               <video
                 ref={videoRef}
-                src={`${API}/media/video.mp4`}
+                src={`${API}/media/video.mp4?v=${videoVersion}`}
                 controls
                 playsInline
                 onTimeUpdate={() => {
