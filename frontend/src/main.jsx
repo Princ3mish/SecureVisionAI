@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye } from 'lucide-react'
 import './styles.css'
 
-const API = 'http://127.0.0.1:8000'
+const API = 'http://127.0.0.1:8001'
 const formatTime = (seconds) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${(seconds % 60).toFixed(1).padStart(4, '0')}`
 
 export default function App() {
@@ -164,7 +164,7 @@ export default function App() {
       <nav className="nav">
         <div className="brand" onClick={() => setCurrentView(isIndexed ? 'studio' : 'landing')}>
           <span className="brand-mark"><Brain size={19}/></span>
-          Moment<span className="muted">/</span>Seek
+          Secure<span className="muted">/</span>VisionAI
         </div>
         <div className="nav-right">
           <button
@@ -514,8 +514,8 @@ export default function App() {
       )}
 
       <footer>
-        <span>Powered by Whisper · BLIP · FAISS</span>
-        <span>Moment-Seek Local Studio</span>
+        <span>Powered by SecureVisionAI · Whisper · BLIP · FAISS</span>
+        <span>SecureVisionAI Local Studio</span>
       </footer>
     </main>
   )
