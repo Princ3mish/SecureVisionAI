@@ -57,8 +57,18 @@ def download_video(url: str, destination: Path, cookies: Path | None = None) -> 
 
     downloaded = candidates[0]
     if destination.exists():
-        destination.unlink()
-    downloaded.rename(destination)
+        try:
+            destination.unlink()
+        except Exception:
+            pass
+    try:
+        downloaded.replace(destination)
+    except Exception:
+        shutil.copy2(downloaded, destination)
+        try:
+            downloaded.unlink()
+        except Exception:
+            pass
     return destination
 
 
@@ -90,27 +100,127 @@ def extract_frames(video: Path, frame_dir: Path, interval: float) -> list[dict]:
     ffmpeg_exe = ensure_ffmpeg()
     frame_dir.mkdir(parents=True, exist_ok=True)
     for old_frame in frame_dir.glob("frame_*.jpg"):
-        old_frame.unlink()
+        try:
+            old_frame.unlink()
+        except Exception:
+            pass
     command = [
-        ffmpeg_exe, "-y", "-i", str(video), "-vf", f"fps=1/{interval}",
+        ffmpeg_exe, "-nostdin", "-y", "-i", str(video), "-vf", f"fps=1/{interval}",
         "-q:v", "2", str(frame_dir / "frame_%06d.jpg"),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+    )
     if completed.returncode:
         raise RuntimeError(f"FFmpeg frame extraction failed:\n{completed.stderr[-2000:]}")
     files = sorted(frame_dir.glob("frame_*.jpg"))
     return [{"path": str(path), "timestamp": i * interval} for i, path in enumerate(files)]
 
 
+def load_audio_safe(video_path: Path, sr: int = 16000):
+    import numpy as np
+
+    ffmpeg_exe = ensure_ffmpeg()
+    cmd = [
+        ffmpeg_exe,
+        "-nostdin",
+        "-threads", "0",
+        "-i", str(video_path),
+        "-f", "s16le",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sr),
+        "-"
+    ]
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        check=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return np.frombuffer(completed.stdout, np.int16).flatten().astype(np.float32) / 32768.0
+
+
 def transcribe(video: Path, device: str) -> list[dict]:
     import whisper
 
-    ensure_ffmpeg()
+    audio = load_audio_safe(video)
     model = whisper.load_model("base", device=device)
-    return model.transcribe(str(video), fp16=device == "cuda")["segments"]
+    return model.transcribe(audio, fp16=device == "cuda")["segments"]
 
 
-def caption_frames(frames: list[dict], device: str) -> list[dict]:
+def groq_caption_frames(
+    frames: list[dict],
+    api_key: str,
+    context: str = "",
+    progress_callback: callable | None = None,
+) -> list[dict]:
+    import base64
+    from groq import Groq
+
+    client = Groq(api_key=api_key)
+    captions = []
+    total = len(frames)
+
+    for i, item in enumerate(frames):
+        if progress_callback:
+            progress_callback(f"Groq Vision analyzing frame {i + 1}/{total} ({item['timestamp']:.1f}s)...")
+        try:
+            with open(item["path"], "rb") as img_f:
+                b64_img = base64.b64encode(img_f.read()).decode("utf-8")
+
+            prompt = (
+                f"Video Background Context: {context if context else 'None'}\n"
+                f"Timestamp: {item['timestamp']}s\n\n"
+                "Examine this video frame in detail:\n"
+                "1. Foreground vs background people, their postures, facial expressions, and gaze.\n"
+                "2. Specific actions & interactions: e.g. someone taking a photo/selfie, holding a phone, sneaking up from behind, photobombing, making funny faces or gestures, turning around, laughing, or reacting.\n"
+                "Write a concise, factual 1-2 sentence description (under 40 words) describing the EXACT visual action taking place right now."
+            )
+
+            completion = client.chat.completions.create(
+                model="llama-3.2-11b-vision-preview",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_img}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=90,
+                temperature=0.2,
+            )
+            desc = completion.choices[0].message.content.strip().replace("\n", " ")
+            print(f"[groq_caption_frames] {item['timestamp']}s -> {desc}")
+            captions.append({
+                "text": f"Visual: {desc}",
+                "timestamp": item["timestamp"],
+                "path": item["path"],
+            })
+        except Exception as exc:
+            print(f"[groq_caption_frames] Warning on frame {item['path']}: {exc}")
+            captions.append({
+                "text": f"Visual: Frame at {item['timestamp']}s",
+                "timestamp": item["timestamp"],
+                "path": item["path"],
+            })
+
+    return captions
+
+
+def caption_frames(frames: list[dict], device: str, context: str = "") -> list[dict]:
     import torch
     from PIL import Image
     from transformers import BlipForConditionalGeneration, BlipProcessor
@@ -120,13 +230,16 @@ def caption_frames(frames: list[dict], device: str) -> list[dict]:
         "Salesforce/blip-image-captioning-base"
     ).to(device)
     captions = []
+    # Generate UNCONDITIONALLY so BLIP observes the image without having its output
+    # hijacked by the context string
     for item in frames:
         image = Image.open(item["path"]).convert("RGB")
         inputs = processor(images=image, return_tensors="pt").to(device)
         with torch.no_grad():
             output = model.generate(**inputs, max_new_tokens=40)
+        desc = processor.decode(output[0], skip_special_tokens=True).strip()
         captions.append({
-            "text": "Visual: " + processor.decode(output[0], skip_special_tokens=True),
+            "text": "Visual: " + desc,
             "timestamp": item["timestamp"],
             "path": item["path"],
         })
@@ -170,6 +283,8 @@ def process_pipeline(
     data_dir: Path,
     interval: float = 5.0,
     progress_callback: callable | None = None,
+    context: str = "",
+    groq_api_key: str = "",
 ) -> dict:
     import torch
 
@@ -181,6 +296,13 @@ def process_pipeline(
     frames_dir = data_dir / "frames"
     index_path = data_dir / "index.faiss"
     docs_path = data_dir / "documents.json"
+    context_path = data_dir / "context.txt"
+
+    # Persist context for use during search
+    if context.strip():
+        context_path.write_text(context.strip(), encoding="utf-8")
+    elif context_path.exists():
+        context_path.unlink()
 
     update_progress("Extracting frames with FFmpeg...")
     frames = extract_frames(video, frames_dir, interval)
@@ -188,14 +310,38 @@ def process_pipeline(
     update_progress("Transcribing audio with Whisper...")
     segments = transcribe(video, device)
 
-    update_progress(f"Generating captions for {len(frames)} frames with BLIP...")
-    captions = caption_frames(frames, device)
+    # Use Groq Vision if an API key is available; otherwise use fixed unconditional BLIP
+    if groq_api_key and groq_api_key.strip():
+        update_progress(f"Analyzing {len(frames)} frames with Groq Llama-3.2 Vision...")
+        try:
+            captions = groq_caption_frames(
+                frames, groq_api_key.strip(), context=context, progress_callback=update_progress
+            )
+        except Exception as groq_err:
+            print(f"[process_pipeline] Groq vision failed, falling back to BLIP: {groq_err}")
+            update_progress(f"Generating captions for {len(frames)} frames with BLIP...")
+            captions = caption_frames(frames, device, context=context)
+    else:
+        update_progress(f"Generating captions for {len(frames)} frames with BLIP...")
+        captions = caption_frames(frames, device, context=context)
 
     update_progress("Building FAISS search index...")
-    documents = (
-        [{"text": "Auditory: " + s["text"].strip(), "timestamp": s["start"]} for s in segments]
-        + captions
-    )
+
+    def get_closest_frame_path(timestamp: float) -> str | None:
+        if not frames:
+            return None
+        return min(frames, key=lambda f: abs(float(f["timestamp"]) - float(timestamp)))["path"]
+
+    auditory_docs = [
+        {
+            "text": "Auditory: " + s["text"].strip(),
+            "timestamp": s["start"],
+            "path": get_closest_frame_path(s["start"]),
+        }
+        for s in segments
+    ]
+
+    documents = auditory_docs + captions
     documents.sort(key=lambda item: item["timestamp"])
     build_index(documents, index_path, docs_path)
 
@@ -205,6 +351,7 @@ def process_pipeline(
         "frames": len(frames),
         "segments": len(segments),
         "device": device,
+        "context": context.strip() if context else None,
     }
 
 

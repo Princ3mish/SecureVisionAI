@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
-import subprocess
-import sys
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
 import faiss
 import numpy as np
+import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sentence_transformers import SentenceTransformer
+
+from app import download_video, process_pipeline
+
 
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
@@ -23,46 +27,118 @@ VIDEO = DATA / "video.mp4"
 FRAMES = DATA / "frames"
 INDEX = DATA / "index.faiss"
 DOCUMENTS = DATA / "documents.json"
-STATUS_FILE = DATA / "task_status.json"
 DATA.mkdir(exist_ok=True)
 
-_venv_bin = str(Path(__file__).resolve().parent.parent / "venv" / "bin")
-if _venv_bin not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+# Load .env file
+load_dotenv(ROOT / ".env")
 
-app = FastAPI(title="SecureVisionAI API")
+
+def get_groq_api_key() -> str:
+    """Retrieve Groq API key from .env or environment dynamically."""
+    load_dotenv(ROOT / ".env", override=True)
+    return os.environ.get("GROQ_API_KEY", "").strip()
+
+
+# In-memory store for background tasks
+# Known limitation: Cleared when server reloads
+tasks: dict[str, dict] = {}
+
+app = FastAPI(title="Secure Vision API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.middleware("http")
+async def add_cache_control_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/media/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 app.mount("/media", StaticFiles(directory=str(DATA)), name="media")
-
-
-def _read_status() -> dict | None:
-    if STATUS_FILE.exists():
-        try:
-            return json.loads(STATUS_FILE.read_text())
-        except Exception:
-            return None
-    return None
-
-
-def _write_status(data: dict) -> None:
-    STATUS_FILE.write_text(json.dumps(data))
 
 
 def public_frame_url(path: str | None) -> str | None:
     if not path:
         return None
-    return "/media/frames/" + Path(path).name
+    p = Path(path)
+    target = p if p.is_absolute() else FRAMES / p.name
+    if not target.exists():
+        target = FRAMES / p.name
+    mtime = int(target.stat().st_mtime) if target.exists() else 0
+    return f"/media/frames/{p.name}?t={mtime}"
+
+
+CONTEXT = DATA / "context.txt"
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ready": INDEX.exists() and DOCUMENTS.exists(), "video": VIDEO.exists()}
+    context_text = CONTEXT.read_text(encoding="utf-8").strip() if CONTEXT.exists() else None
+    groq_key = get_groq_api_key()
+    return {
+        "ready": INDEX.exists() and DOCUMENTS.exists(),
+        "video": VIDEO.exists(),
+        "context": context_text,
+        "groq_enabled": bool(groq_key),
+    }
+
+
+@app.get("/api/settings")
+def get_settings() -> dict:
+    groq_key = get_groq_api_key()
+    masked = (groq_key[:4] + "..." + groq_key[-4:]) if len(groq_key) > 8 else ("Configured" if groq_key else "")
+    return {
+        "groq_configured": bool(groq_key),
+        "groq_key_masked": masked,
+    }
+
+
+@app.post("/api/settings")
+def update_settings(groq_api_key: str = Form(default="")) -> dict:
+    cleaned = groq_api_key.strip()
+    env_file = ROOT / ".env"
+    env_file.write_text(f"# Groq Cloud API Key\nGROQ_API_KEY={cleaned}\n", encoding="utf-8")
+    load_dotenv(env_file, override=True)
+    return {"saved": True, "groq_configured": bool(cleaned)}
+
+
+def _background_worker(task_id: str, video_path: Path, interval: float, context: str = "") -> None:
+    def on_progress(stage: str):
+        if task_id in tasks:
+            tasks[task_id]["stage"] = stage
+
+    try:
+        groq_key = get_groq_api_key()
+        print(f"[_background_worker] calling process_pipeline with video_path={video_path}, interval={interval}, context={context!r}, groq_key={bool(groq_key)}")
+        result = process_pipeline(
+            video_path,
+            DATA,
+            interval,
+            progress_callback=on_progress,
+            context=context,
+            groq_api_key=groq_key,
+        )
+        print(f"[_background_worker] process_pipeline returned: {result}")
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["stage"] = "Complete"
+        tasks[task_id]["result"] = result
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["stage"] = "Error"
+        tasks[task_id]["error"] = str(exc)
 
 
 @app.post("/api/process")
@@ -71,7 +147,9 @@ async def process_video(
     url: str = Form(default=""),
     interval: float = Form(default=5.0),
     cookies: UploadFile | None = File(default=None),
+    context: str = Form(default=""),
 ) -> dict:
+    print(f"[process_video] video truthy={bool(video)}, video.filename={video.filename if video else None}, url={url!r}, interval={interval}, context={context!r}, VIDEO.exists={VIDEO.exists()}")
     if not video and not url.strip() and not VIDEO.exists():
         raise HTTPException(400, "Upload a video or provide a video URL.")
     try:
@@ -85,26 +163,19 @@ async def process_video(
                 cookie_path = DATA / "cookies.txt"
                 with cookie_path.open("wb") as output:
                     shutil.copyfileobj(cookies.file, output)
-            from app import download_video
             download_video(url.strip(), VIDEO, cookie_path)
 
         task_id = str(uuid.uuid4())
-        _write_status({
+        tasks[task_id] = {
             "task_id": task_id,
             "status": "processing",
-            "stage": "Starting processing...",
+            "stage": "Starting background worker...",
             "error": None,
             "result": None,
-        })
+        }
 
-        worker_script = ROOT / "_worker.py"
-        env = os.environ.copy()
-        env["PATH"] = _venv_bin + os.pathsep + env.get("PATH", "")
-        subprocess.Popen(
-            [sys.executable, str(worker_script), str(VIDEO), str(DATA), str(interval), task_id],
-            env=env,
-            cwd=str(ROOT),
-        )
+        # Run CPU-bound processing in a separate thread so polling requests remain non-blocking
+        asyncio.create_task(asyncio.to_thread(_background_worker, task_id, VIDEO, interval, context.strip()))
 
         return {"task_id": task_id, "status": "processing"}
     except Exception as exc:
@@ -113,28 +184,177 @@ async def process_video(
 
 @app.get("/api/status/{task_id}")
 def get_task_status(task_id: str) -> dict:
-    st = _read_status()
-    if not st or st.get("task_id") != task_id:
+    if task_id not in tasks:
         raise HTTPException(404, f"Task {task_id} not found.")
-    return st
+    return tasks[task_id]
+
+
+_search_model: SentenceTransformer | None = None
+
+
+def get_search_model() -> SentenceTransformer:
+    global _search_model
+    if _search_model is None:
+        _search_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _search_model
+
+
+def groq_reason_and_rerank(query: str, context: str, candidates: list[dict], api_key: str) -> dict | None:
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+
+        snippets = []
+        for idx, c in enumerate(candidates):
+            snippets.append(f"[{idx}] Timestamp {c['timestamp']:.1f}s: {c['text']}")
+
+        prompt = f"""You are an advanced video intelligence reasoning model.
+Video Background Context: "{context if context else 'None'}"
+User Search Query: "{query}"
+
+Candidate video moments:
+{chr(10).join(snippets)}
+
+Task:
+1. Examine the visual actions and dialogue in these candidates.
+2. Determine which candidate represents the EXACT point the user is searching for (e.g. photobombing, sneaking behind someone, making funny faces, taking selfie, reacting).
+3. Explain why this moment is the exact target point in 1-2 concise sentences.
+
+Return valid JSON only matching this schema:
+{{
+  "best_index": 0,
+  "reasoning": "At 00:15.0, the actress sneaks up making a funny face behind the fans while they take a selfie on their phone.",
+  "ranked_indices": [0, 1, 2]
+}}"""
+
+        # Try models available on Groq in priority order
+        models_to_try = ["qwen/qwen3.8-27b", "allam-2-7b", "llama-3.3-70b-versatile"]
+        for model_name in models_to_try:
+            try:
+                res = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    max_tokens=220,
+                )
+                return json.loads(res.choices[0].message.content)
+            except Exception as model_err:
+                print(f"[groq_reason_and_rerank] Model {model_name} failed: {model_err}, trying next...")
+                continue
+        return None
+    except Exception as exc:
+        print(f"[groq_reason_and_rerank] Warning: {exc}")
+        return None
 
 
 @app.get("/api/search")
 def search(q: str, top_k: int = 6) -> dict:
     if not INDEX.exists() or not DOCUMENTS.exists():
         raise HTTPException(409, "Process a video before searching.")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    index = faiss.read_index(str(INDEX))
-    documents = json.loads(DOCUMENTS.read_text(encoding="utf-8"))
-    vector = model.encode([q], convert_to_numpy=True).astype(np.float32)
-    distances, indices = index.search(vector, min(top_k, index.ntotal))
-    results = []
-    for distance, index_value in zip(distances[0], indices[0]):
-        item = documents[int(index_value)]
-        results.append({
-            "text": item["text"],
-            "timestamp": item["timestamp"],
-            "distance": float(distance),
-            "frame": public_frame_url(item.get("path")),
-        })
-    return {"query": q, "results": results}
+    try:
+        model = get_search_model()
+        index = faiss.read_index(str(INDEX))
+        documents = json.loads(DOCUMENTS.read_text(encoding="utf-8"))
+        video_context = CONTEXT.read_text(encoding="utf-8").strip() if CONTEXT.exists() else ""
+        print(f"[search] documents loaded: len(documents)={len(documents)}, index.ntotal={index.ntotal}, context={video_context!r}")
+
+        # Compute query vector; if context is available, compute fused contextual embedding
+        raw_vector = model.encode([q], convert_to_numpy=True).astype(np.float32)
+        if video_context:
+            context_vector = model.encode([f"{video_context}. {q}"], convert_to_numpy=True).astype(np.float32)
+            vector = 0.65 * raw_vector + 0.35 * context_vector
+            vector = vector / np.linalg.norm(vector, axis=1, keepdims=True)
+        else:
+            vector = raw_vector
+
+        k = min(top_k, index.ntotal)
+        if k <= 0:
+            return {"query": q, "results": [], "context": video_context, "workflow": []}
+
+        distances, indices = index.search(vector, k)
+        results = []
+        visual_candidates = [d for d in documents if d.get("path")]
+
+        for rank, (distance, index_value) in enumerate(zip(distances[0], indices[0])):
+            idx = int(index_value)
+            if idx < 0 or idx >= len(documents):
+                continue
+            item = documents[idx]
+            frame_path = item.get("path")
+            if not frame_path and visual_candidates:
+                ts = float(item.get("timestamp", 0.0))
+                closest = min(visual_candidates, key=lambda d: abs(float(d.get("timestamp", 0.0)) - ts))
+                frame_path = closest.get("path")
+
+            dist_val = float(distance)
+            match_score = round(float(1.0 / (1.0 + dist_val)), 3)
+            results.append({
+                "text": item["text"],
+                "timestamp": item["timestamp"],
+                "distance": dist_val,
+                "score": match_score,
+                "frame": public_frame_url(frame_path),
+                "is_preferred": (rank == 0),
+            })
+
+        # Check for Groq Reasoning
+        groq_key = get_groq_api_key()
+        ai_reasoning = ""
+        groq_active = False
+
+        if groq_key and len(results) > 1:
+            reasoning_data = groq_reason_and_rerank(q, video_context, results, groq_key)
+            if reasoning_data and "best_index" in reasoning_data:
+                groq_active = True
+                best_idx = int(reasoning_data["best_index"])
+                ai_reasoning = reasoning_data.get("reasoning", "")
+
+                if 0 <= best_idx < len(results):
+                    best_item = results.pop(best_idx)
+                    results.insert(0, best_item)
+
+                for r_idx, r in enumerate(results):
+                    r["is_preferred"] = (r_idx == 0)
+                if ai_reasoning:
+                    results[0]["ai_reasoning"] = ai_reasoning
+
+        workflow_steps = [
+            {
+                "id": "query_proc",
+                "title": "Contextual Query Fusion",
+                "detail": f"Fused query '{q}' with video context: \"{video_context}\"" if video_context else f"Encoded raw query '{q}' with all-MiniLM-L6-v2",
+                "active": bool(video_context),
+            },
+            {
+                "id": "index_scan",
+                "title": "Multimodal Vector Retrieval",
+                "detail": f"Queried FAISS index across {index.ntotal} visual & speech embeddings",
+                "active": True,
+            },
+            {
+                "id": "rerank",
+                "title": "LLM Semantic Reasoning (Groq Llama-3.3)" if groq_active else "Semantic Relevance Scoring",
+                "detail": f"Reasoned: {ai_reasoning}" if ai_reasoning else "Calculated cosine proximity & prioritized context-aligned visual moments",
+                "active": True,
+            },
+            {
+                "id": "preferred",
+                "title": "Preferred Moment Selection",
+                "detail": f"Rank #1 pinpointed as target moment ({int(results[0]['score'] * 100)}% match)" if results else "No matches found",
+                "active": True,
+            },
+        ]
+
+        print(f"[search] returning len(results)={len(results)}, context_active={bool(video_context)}, groq_active={groq_active}")
+        return {
+            "query": q,
+            "context": video_context,
+            "results": results,
+            "workflow": workflow_steps,
+            "groq_active": groq_active,
+        }
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Search failed: {exc}") from exc

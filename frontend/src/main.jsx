@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye } from 'lucide-react'
+import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye, CheckCircle2, Star, Layers, Key, X, ExternalLink } from 'lucide-react'
 import './styles.css'
 
-const API = 'http://127.0.0.1:8001'
+const API = 'http://127.0.0.1:8000'
 const formatTime = (seconds) => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${(seconds % 60).toFixed(1).padStart(4, '0')}`
 
 export default function App() {
@@ -11,7 +11,10 @@ export default function App() {
   const [file, setFile] = useState(null)
   const [url, setUrl] = useState('')
   const [interval, setIntervalValue] = useState(5)
-  const [query, setQuery] = useState('missile launch')
+  const [context, setContext] = useState('')
+  const [videoContext, setVideoContext] = useState('')
+  const [workflow, setWorkflow] = useState([])
+  const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [stats, setStats] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -21,13 +24,19 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0)
   const [videoVersion, setVideoVersion] = useState(Date.now())
 
+  // Groq API integration state
+  const [groqEnabled, setGroqEnabled] = useState(false)
+  const [showKeyModal, setShowKeyModal] = useState(false)
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [maskedKey, setMaskedKey] = useState('')
+
   // Navigation state: 'landing' | 'upload' | 'studio'
   const [currentView, setCurrentView] = useState('landing')
   
   // Skeleton loader testing state (allows previewing loading state)
   const [showSkeletons, setShowSkeletons] = useState(false)
 
-  // Check health on mount to see if an active video & index already exists
+  // Check health and settings on mount
   useEffect(() => {
     async function checkHealth() {
       try {
@@ -37,9 +46,22 @@ export default function App() {
           if (data.ready && data.video) {
             setIsIndexed(true)
             setVideoVersion(Date.now())
-            setCurrentView('studio')
+            if (data.context) {
+              setVideoContext(data.context)
+              setContext(data.context)
+            }
             setMessage('Existing index loaded and ready to search.')
           }
+          if (data.groq_enabled) {
+            setGroqEnabled(true)
+          }
+        }
+
+        const settingsRes = await fetch(`${API}/api/settings`)
+        if (settingsRes.ok) {
+          const sData = await settingsRes.json()
+          setGroqEnabled(sData.groq_configured)
+          setMaskedKey(sData.groq_key_masked)
         }
       } catch (err) {
         console.warn('Backend not ready yet:', err)
@@ -47,6 +69,23 @@ export default function App() {
     }
     checkHealth()
   }, [])
+
+  async function saveGroqKey(e) {
+    e.preventDefault()
+    try {
+      const form = new FormData()
+      form.append('groq_api_key', apiKeyInput.trim())
+      const res = await fetch(`${API}/api/settings`, { method: 'POST', body: form })
+      const data = await res.json()
+      if (data.saved) {
+        setGroqEnabled(data.groq_configured)
+        setShowKeyModal(false)
+        setMessage(data.groq_configured ? 'Groq Llama-3.2 Vision & Reasoning activated!' : 'Groq key removed. Using local models.')
+      }
+    } catch (err) {
+      console.error(err)
+    }
+  }
 
   // IntersectionObserver for lightweight entrance animations on scroll
   useEffect(() => {
@@ -75,6 +114,8 @@ export default function App() {
     if (file) form.append('video', file)
     if (url) form.append('url', url)
     form.append('interval', interval)
+    if (context.trim()) form.append('context', context.trim())
+
     try {
       const response = await fetch(`${API}/api/process`, { method: 'POST', body: form })
       const data = await response.json()
@@ -93,7 +134,12 @@ export default function App() {
             clearInterval(poll)
             setStats(task.result)
             setIsIndexed(true)
+            setVideoContext(context.trim())
+            setWorkflow([])
             setVideoVersion(Date.now())
+            setQuery('')
+            setResults([])
+            setActiveMoment(null)
             setCurrentView('studio')
             setMessage(`Index ready · ${task.result.frames} frames · ${task.result.segments} transcript segments · ${task.result.device}`)
             setBusy(false)
@@ -123,12 +169,14 @@ export default function App() {
     event.preventDefault()
     if (!query.trim()) return
     setBusy(true)
-    setMessage('Searching the visual and audio index…')
+    setMessage('Executing retrieval workflow…')
     try {
       const response = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=6`)
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Search failed')
-      setResults(data.results)
+      setResults(data.results || [])
+      if (data.workflow) setWorkflow(data.workflow)
+      if (data.context) setVideoContext(data.context)
       setMessage(`${data.results.length} relevant moments found.`)
     } catch (error) {
       setMessage(error.message)
@@ -152,6 +200,10 @@ export default function App() {
     setActiveMoment(null)
     setFile(null)
     setUrl('')
+    setContext('')
+    setVideoContext('')
+    setWorkflow([])
+    setQuery('')
     setMessage('Ready to build your video index.')
     setCurrentView('upload')
   }
@@ -162,9 +214,9 @@ export default function App() {
   return (
     <main className="shell">
       <nav className="nav">
-        <div className="brand" onClick={() => setCurrentView(isIndexed ? 'studio' : 'landing')}>
-          <span className="brand-mark"><Brain size={19}/></span>
-          Secure<span className="muted">/</span>VisionAI
+        <div className="brand" onClick={() => setCurrentView('landing')}>
+          <span className="brand-mark"><Shield size={19}/></span>
+          Secure<span className="muted">/</span>Vision
         </div>
         <div className="nav-right">
           <button
@@ -190,9 +242,14 @@ export default function App() {
               <Plus size={14}/> New Video
             </button>
           )}
-          <div className="nav-pill">
-            <span className="pulse"/> LOCAL AI STUDIO
-          </div>
+          <button
+            className={`groq-toggle-pill ${groqEnabled ? 'is-active' : ''}`}
+            onClick={() => setShowKeyModal(true)}
+            title="Configure Groq Cloud API Key"
+          >
+            <Zap size={13} className={groqEnabled ? "groq-active-zap" : ""}/>
+            <span>{groqEnabled ? "GROQ AI ACTIVE" : "CONNECT GROQ"}</span>
+          </button>
         </div>
       </nav>
 
@@ -209,9 +266,16 @@ export default function App() {
               <p className="landing-subhead">
                 Pinpoint exact scenes or audio moments instantly with high-performance local AI transcription and visual frame search.
               </p>
-              <button className="btn-primary" onClick={() => setCurrentView('upload')}>
-                <Zap size={17} /> Build Video Index <ChevronRight size={17} />
-              </button>
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                <button className="btn-primary" onClick={() => setCurrentView('upload')}>
+                  <Zap size={17} /> Build Video Index <ChevronRight size={17} />
+                </button>
+                {isIndexed && (
+                  <button className="btn-secondary" onClick={() => setCurrentView('studio')}>
+                    <Play size={17} /> Open Studio <ChevronRight size={17} />
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* NEW HERO ANIMATION: Frames ejecting from source video */}
@@ -328,6 +392,30 @@ export default function App() {
                 onChange={e => setUrl(e.target.value)}
               />
 
+              {/* Optional Video Context Input */}
+              <div className="context-card">
+                <div className="context-card-header">
+                  <div className="context-title">
+                    <Sparkles size={16} className="context-icon" />
+                    <span>Video Context / Description</span>
+                    <span className="optional-badge">Optional</span>
+                  </div>
+                  <span className="context-boost-pill">
+                    {groqEnabled ? "⚡ Groq Llama-3.2 Vision" : "AI Guidance Boost"}
+                  </span>
+                </div>
+                <p className="context-desc">
+                  Provide background context (e.g. actress photobombing fans, cooking tutorial, product demo). {groqEnabled ? "Groq Multimodal Vision (Llama 3.2) will inspect each frame's visual actions and people in detail to accurately spot actions like photobombing, sneaks, and reactions." : "AI uses your context to boost precision and guide captioning without losing actual frame actions."}
+                </p>
+                <textarea
+                  className="context-textarea"
+                  rows={3}
+                  value={context}
+                  onChange={e => setContext(e.target.value)}
+                  placeholder="e.g. The actress was photobombing her fans who were taking a photo together..."
+                />
+              </div>
+
               <div className="range-container">
                 <div className="range-label">
                   <span>Frame Sampling Interval</span>
@@ -422,21 +510,62 @@ export default function App() {
               </div>
             </div>
 
+            {/* Active Context Banner */}
+            {videoContext && (
+              <div className="active-context-banner">
+                <div className="active-context-tag">
+                  <Sparkles size={13} />
+                  <span>Context Enabled</span>
+                </div>
+                <div className="active-context-text">
+                  "{videoContext}"
+                </div>
+              </div>
+            )}
+
             <form className="searchbar" onSubmit={searchVideo}>
               <Search size={18}/>
               <input
                 value={query}
                 onChange={e => setQuery(e.target.value)}
-                placeholder="Try: missile launch, explosion, speech..."
+                placeholder="Search dialogue, visual actions, objects, or scenes..."
               />
               <button className="btn-primary" style={{ padding: '8px 18px', fontSize: '13px' }} disabled={busy}>
                 <Search size={15}/> Search
               </button>
             </form>
 
+            {/* Multimodal Retrieval Workflow Display */}
+            {workflow.length > 0 && (
+              <div className="retrieval-workflow-card">
+                <div className="workflow-card-header">
+                  <div className="workflow-card-title">
+                    <Layers size={14} />
+                    <span>Multimodal Retrieval Workflow</span>
+                  </div>
+                  <span className={`workflow-mode-pill ${videoContext ? 'context-pill' : 'standard-pill'}`}>
+                    {videoContext ? 'Context-Guided' : 'Standard FAISS'}
+                  </span>
+                </div>
+                <div className="workflow-stepper">
+                  {workflow.map((step, sIdx) => (
+                    <div className={`workflow-step-node ${step.active ? 'is-active' : ''}`} key={step.id || sIdx}>
+                      <div className="step-node-bubble">
+                        <CheckCircle2 size={13} />
+                      </div>
+                      <div className="step-node-content">
+                        <span className="step-node-title">{step.title}</span>
+                        <span className="step-node-detail">{step.detail}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="results-header">
               <span className="results-count">
-                {busy ? 'Searching index...' : results.length ? `${results.length} relevant moments` : 'Moments timeline'}
+                {busy ? 'Running retrieval workflow...' : results.length ? `${results.length} relevant moments` : 'Moments timeline'}
               </span>
               <button
                 className="skeleton-toggle-btn"
@@ -465,15 +594,50 @@ export default function App() {
               ) : results.length ? (
                 results.map((result, i) => {
                   const isSelected = activeMoment && activeMoment.timestamp === result.timestamp
+                  const matchPct = Math.round((result.score || (1 / (1 + result.distance))) * 100)
                   return (
                     <article
-                      className={`result ${isSelected ? 'active' : ''}`}
+                      className={`result ${isSelected ? 'active' : ''} ${result.is_preferred ? 'preferred-result' : ''}`}
                       key={`${result.timestamp}-${i}`}
                       onClick={() => seekTo(result.timestamp, result)}
                     >
+                      {result.is_preferred && (
+                        <div className="preferred-banner">
+                          <div className="preferred-label">
+                            <Star size={13} fill="currentColor" />
+                            <span>Most Preferred Match</span>
+                          </div>
+                          <span className="preferred-badge-pill">{matchPct}% Relevance</span>
+                        </div>
+                      )}
+
+                      {result.ai_reasoning && (
+                        <div className="ai-reasoning-callout">
+                          <Sparkles size={14} className="reasoning-sparkle" />
+                          <div className="reasoning-text">
+                            <strong>AI Moment Insight:</strong> {result.ai_reasoning}
+                          </div>
+                        </div>
+                      )}
+
                       <div className="result-main">
                         <div className="thumb">
-                          {result.frame && <img src={`${API}${result.frame}`} alt="Frame preview"/>}
+                          {result.frame ? (
+                            <img
+                              src={`${API}${result.frame}${result.frame.includes('?') ? '&' : '?'}v=${videoVersion}`}
+                              alt="Frame preview"
+                              loading="lazy"
+                              onError={(e) => {
+                                e.currentTarget.style.display = 'none'
+                                const fb = e.currentTarget.parentElement.querySelector('.thumb-fallback')
+                                if (fb) fb.style.display = 'flex'
+                              }}
+                            />
+                          ) : null}
+                          <div className="thumb-fallback" style={{ display: result.frame ? 'none' : 'flex' }}>
+                            {result.text.startsWith('Auditory:') ? <Radio size={18} /> : <Eye size={18} />}
+                            <span>{result.text.startsWith('Auditory:') ? 'Audio Moment' : 'Scene Frame'}</span>
+                          </div>
                           <div className="thumb-play">
                             <Play size={20} fill="currentColor"/>
                           </div>
@@ -482,7 +646,12 @@ export default function App() {
                           <div className="result-meta">
                             <span className="rank">#{i + 1}</span>
                             <span className="time-tag">{formatTime(result.timestamp)}</span>
-                            <span className="score">match {(1 / (1 + result.distance)).toFixed(2)}</span>
+                            {result.text.startsWith('Auditory:') ? (
+                              <span className="kind-badge kind-audio"><Radio size={11}/> Audio</span>
+                            ) : (
+                              <span className="kind-badge kind-visual"><Eye size={11}/> Visual</span>
+                            )}
+                            <span className="score">match {matchPct}%</span>
                           </div>
                           <p>{result.text}</p>
                         </div>
@@ -514,9 +683,74 @@ export default function App() {
       )}
 
       <footer>
-        <span>Powered by SecureVisionAI · Whisper · BLIP · FAISS</span>
-        <span>SecureVisionAI Local Studio</span>
+        <span>Powered by Whisper · BLIP · FAISS · Groq</span>
+        <span>Secure Vision Local Studio</span>
       </footer>
+
+      {/* Groq API Key Configuration Modal */}
+      {showKeyModal && (
+        <div className="modal-backdrop" onClick={() => setShowKeyModal(false)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">
+                <Zap size={18} className="modal-icon" />
+                <h3>Groq Cloud API Settings</h3>
+              </div>
+              <button className="modal-close" onClick={() => setShowKeyModal(false)}>
+                <X size={18} />
+              </button>
+            </div>
+            
+            <p className="modal-subtitle">
+              Power your video search with ultra-fast <b>Llama 3.2 Multimodal Vision</b> and <b>Llama 3.3 Reasoning</b> to understand complex actions like photobombing, sneaks, gestures, and reactions.
+            </p>
+
+            <form onSubmit={saveGroqKey}>
+              <div className="modal-field-group">
+                <div className="field-label-row">
+                  <span>Groq API Key</span>
+                  <a
+                    href="https://console.groq.com/keys"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="key-link"
+                  >
+                    Get Free Key <ExternalLink size={12} />
+                  </a>
+                </div>
+                <input
+                  type="password"
+                  className="modal-key-input"
+                  placeholder={maskedKey ? `Current: ${maskedKey}` : "gsk_..."}
+                  value={apiKeyInput}
+                  onChange={e => setApiKeyInput(e.target.value)}
+                />
+                <span className="field-help-note">
+                  Saved directly to <code>backend/.env</code> on your local device.
+                </span>
+              </div>
+
+              <div className="modal-actions">
+                {groqEnabled && (
+                  <button
+                    type="button"
+                    className="btn-modal-clear"
+                    onClick={() => {
+                      setApiKeyInput('')
+                      saveGroqKey({ preventDefault: () => {} })
+                    }}
+                  >
+                    Clear Key
+                  </button>
+                )}
+                <button type="submit" className="btn-primary" style={{ marginLeft: 'auto' }}>
+                  Save & Activate
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </main>
   )
 }
