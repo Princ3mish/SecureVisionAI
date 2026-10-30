@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye, CheckCircle2, Star, Layers, Key, X, ExternalLink } from 'lucide-react'
+import { Brain, ChevronRight, FileVideo, Play, Plus, RotateCcw, Search, Sparkles, Upload, Video, Zap, Shield, Radio, Eye, CheckCircle2, Star, Layers, Key, X, ExternalLink, Cpu, Database } from 'lucide-react'
 import './styles.css'
 
 const API = 'http://127.0.0.1:8000'
@@ -23,6 +23,9 @@ export default function App() {
   const [activeMoment, setActiveMoment] = useState(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [videoVersion, setVideoVersion] = useState(Date.now())
+
+  // AI-Assisted vs Non-AI Assisted mode toggle (Default: Non-AI running locally on system)
+  const [aiMode, setAiMode] = useState(false)
 
   // Groq API integration state
   const [groqEnabled, setGroqEnabled] = useState(false)
@@ -87,6 +90,14 @@ export default function App() {
     }
   }
 
+  // Handle switching between AI Assisted and Non-AI Assisted mode
+  function handleModeChange(newMode) {
+    setAiMode(newMode)
+    if (query.trim() && isIndexed) {
+      searchVideo(null, newMode)
+    }
+  }
+
   // IntersectionObserver for lightweight entrance animations on scroll
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -109,12 +120,13 @@ export default function App() {
   async function processVideo(event) {
     event.preventDefault()
     setBusy(true)
-    setMessage('Initiating video processing…')
+    setMessage(aiMode ? 'Initiating video processing with AI assistance…' : 'Initiating video processing in non-AI local mode…')
     const form = new FormData()
     if (file) form.append('video', file)
     if (url) form.append('url', url)
     form.append('interval', interval)
     if (context.trim()) form.append('context', context.trim())
+    form.append('ai_mode', aiMode)
 
     try {
       const response = await fetch(`${API}/api/process`, { method: 'POST', body: form })
@@ -165,19 +177,20 @@ export default function App() {
     }
   }
 
-  async function searchVideo(event) {
-    event.preventDefault()
+  async function searchVideo(event, overrideAiMode = null) {
+    if (event) event.preventDefault()
     if (!query.trim()) return
+    const activeMode = overrideAiMode !== null ? overrideAiMode : aiMode
     setBusy(true)
-    setMessage('Executing retrieval workflow…')
+    setMessage(activeMode ? 'Executing AI-assisted retrieval workflow (Groq Secret Key)...' : 'Executing non-AI vector search locally on system (FAISS)...')
     try {
-      const response = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=6`)
+      const response = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=6&ai_mode=${activeMode}`)
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || 'Search failed')
       setResults(data.results || [])
       if (data.workflow) setWorkflow(data.workflow)
       if (data.context) setVideoContext(data.context)
-      setMessage(`${data.results.length} relevant moments found.`)
+      setMessage(`${data.results.length} moments found (${activeMode ? 'AI-Assisted via Groq' : 'Running Locally on System'}).`)
     } catch (error) {
       setMessage(error.message)
     } finally {
@@ -237,18 +250,42 @@ export default function App() {
           >
             Studio
           </button>
+
+          {/* AI-Assisted vs Non-AI Assisted Segmented Switcher */}
+          <div className="mode-toggle-group" role="group" aria-label="Engine Mode">
+            <button
+              type="button"
+              className={`mode-toggle-btn ${!aiMode ? 'is-active non-ai-mode' : ''}`}
+              onClick={() => handleModeChange(false)}
+              title="Preferable: Non-AI Mode running locally using local system models"
+            >
+              <Cpu size={12} />
+              <span>Non-AI (Local)</span>
+            </button>
+            <button
+              type="button"
+              className={`mode-toggle-btn ${aiMode ? 'is-active ai-mode' : ''}`}
+              onClick={() => handleModeChange(true)}
+              title="AI Mode: Uses Groq API secret key for enhanced reasoning"
+            >
+              <Sparkles size={12} className={aiMode ? "sparkle-icon-active" : ""} />
+              <span>AI Mode (Groq)</span>
+            </button>
+          </div>
+
           {isIndexed && (
             <button className="btn-secondary" onClick={resetWorkspace} title="Replace index with a new video">
               <Plus size={14}/> New Video
             </button>
           )}
+
           <button
             className={`groq-toggle-pill ${groqEnabled ? 'is-active' : ''}`}
             onClick={() => setShowKeyModal(true)}
             title="Configure Groq Cloud API Key"
           >
             <Zap size={13} className={groqEnabled ? "groq-active-zap" : ""}/>
-            <span>{groqEnabled ? "GROQ AI ACTIVE" : "CONNECT GROQ"}</span>
+            <span>{groqEnabled ? "GROQ KEY SET" : "CONNECT GROQ"}</span>
           </button>
         </div>
       </nav>
@@ -264,7 +301,7 @@ export default function App() {
                 <span style={{ color: 'var(--accent-highlight)' }}>Not the whole video.</span>
               </h1>
               <p className="landing-subhead">
-                Pinpoint exact scenes or audio moments instantly with high-performance local AI transcription and visual frame search.
+                Pinpoint exact scenes or audio moments instantly with dual retrieval engines: <b>Non-AI mode running 100% locally</b> on your system models, or <b>AI-assisted mode</b> using your Groq secret key for enhanced multimodal reasoning.
               </p>
               <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
                 <button className="btn-primary" onClick={() => setCurrentView('upload')}>
@@ -278,9 +315,8 @@ export default function App() {
               </div>
             </div>
 
-            {/* NEW HERO ANIMATION: Frames ejecting from source video */}
+            {/* Central Source Video Box with Frames Graphic */}
             <div className="hero-frames-graphic">
-              {/* Central Source Video Box */}
               <div className="source-video-box">
                 <div className="source-video-icon">
                   <Play size={16} fill="currentColor" />
@@ -321,33 +357,33 @@ export default function App() {
 
           <div className="features-section">
             <div className="features-header">
-              <h2>Engineered for Instant Video Search</h2>
-              <p>Multimodal intelligence executing 100% locally on your workstation</p>
+              <h2>Engineered for Dual Search Intelligence</h2>
+              <p>Run locally on your system by default, or enable AI mode with your Groq API secret key</p>
             </div>
 
             <div className="features-grid">
               <div className="feature-card reveal-on-scroll">
-                <div className="feature-icon">
-                  <Radio size={22} />
+                <div className="feature-icon feature-icon-local">
+                  <Cpu size={22} />
                 </div>
-                <h3>Audio & Speech Search</h3>
-                <p>Transcribe and match spoken dialogue instantly using Whisper embeddings for exact keyword and semantic moments.</p>
+                <h3>Non-AI Mode (Preferred Local Default)</h3>
+                <p>Runs 100% on your system using local FAISS and SentenceTransformers. Zero Groq API calls, zero cloud dependency, and total data privacy.</p>
               </div>
 
               <div className="feature-card reveal-on-scroll">
-                <div className="feature-icon">
-                  <Eye size={22} />
+                <div className="feature-icon feature-icon-ai">
+                  <Sparkles size={22} />
                 </div>
-                <h3>Visual & Scene Search</h3>
-                <p>Scan video frames with BLIP visual models to locate objects, actions, logos, and key visual moments.</p>
+                <h3>AI Mode (Groq API Key)</h3>
+                <p>When enabled, utilizes your secret Groq key to run Llama-3.2 Multimodal Vision and Llama-3.3 reasoning for subtle gestures, photobombs, and emotions.</p>
               </div>
 
               <div className="feature-card reveal-on-scroll">
                 <div className="feature-icon">
                   <Shield size={22} />
                 </div>
-                <h3>100% Local & Private</h3>
-                <p>Zero cloud uploads. All index vectors, frames, and audio tensors stay completely private on your machine.</p>
+                <h3>100% Local Storage & Vectors</h3>
+                <p>All video frames, FAISS indexes, and extracted audio tensors remain safely saved directly on your workstation.</p>
               </div>
             </div>
           </div>
@@ -392,7 +428,7 @@ export default function App() {
                 onChange={e => setUrl(e.target.value)}
               />
 
-              {/* Optional Video Context Input */}
+              {/* Video Context Input */}
               <div className="context-card">
                 <div className="context-card-header">
                   <div className="context-title">
@@ -400,12 +436,14 @@ export default function App() {
                     <span>Video Context / Description</span>
                     <span className="optional-badge">Optional</span>
                   </div>
-                  <span className="context-boost-pill">
-                    {groqEnabled ? "⚡ Groq Llama-3.2 Vision" : "AI Guidance Boost"}
+                  <span className={`context-boost-pill ${aiMode ? 'ai-pill' : 'non-ai-pill'}`}>
+                    {aiMode ? (groqEnabled ? "⚡ Groq Vision Enabled" : "AI Mode Active") : "⚙️ Local Non-AI Mode"}
                   </span>
                 </div>
                 <p className="context-desc">
-                  Provide background context (e.g. actress photobombing fans, cooking tutorial, product demo). {groqEnabled ? "Groq Multimodal Vision (Llama 3.2) will inspect each frame's visual actions and people in detail to accurately spot actions like photobombing, sneaks, and reactions." : "AI uses your context to boost precision and guide captioning without losing actual frame actions."}
+                  {aiMode 
+                    ? "In AI Assisted mode, Groq Multimodal Vision (Llama-3.2) inspects each frame's visual actions and people in detail to accurately spot actions like photobombing, sneaks, and reactions."
+                    : "In Non-AI mode, frames are indexed with local BLIP models and searched using pure mathematical vector distance without cloud LLM inference."}
                 </p>
                 <textarea
                   className="context-textarea"
@@ -440,7 +478,7 @@ export default function App() {
               </div>
 
               <button className="btn-primary" style={{ width: '100%' }} disabled={busy}>
-                <Zap size={17}/> {busy ? 'Processing Video…' : 'Build Searchable Index'}
+                <Zap size={17}/> {busy ? 'Processing Video…' : `Build Index (${aiMode ? 'AI Assisted (Groq)' : 'Non-AI (Local System)'})`}
                 <ChevronRight size={17}/>
               </button>
             </form>
@@ -504,9 +542,52 @@ export default function App() {
           <section className="panel search-panel">
             <div className="panel-heading">
               <span className="step">02</span>
-              <div>
-                <h2>Search Moments</h2>
+              <div style={{ width: '100%' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                  <h2>Search Moments</h2>
+                  <span className={`engine-badge-tag ${aiMode ? 'ai-tag' : 'non-ai-tag'}`}>
+                    {aiMode ? '⚡ AI Mode (Groq Key)' : '⚙️ Non-AI (Local System)'}
+                  </span>
+                </div>
                 <p>Query what was shown or spoken in this video.</p>
+              </div>
+            </div>
+
+            {/* Prominent Live Engine Mode Status & Switcher Card */}
+            <div className={`engine-control-banner ${aiMode ? 'ai-active' : 'local-active'}`}>
+              <div className="engine-status-info">
+                <div className="engine-status-headline">
+                  <span className={aiMode ? "engine-indicator-dot ai" : "engine-indicator-dot local"} />
+                  <strong>
+                    {aiMode ? "AI Mode Active (Groq Secret Key Enabled)" : "Non-AI Mode Active (Running Locally on System)"}
+                  </strong>
+                </div>
+                <p className="engine-status-subtext">
+                  {aiMode 
+                    ? "Using secret Groq API key from .env for Llama-3.2 Multimodal Vision & Llama-3.3 semantic reasoning for superior results."
+                    : "Running 100% locally using system models (FAISS + MiniLM). Zero Groq API calls made. Completely private."}
+                </p>
+              </div>
+              
+              <div className="engine-action-switch">
+                <button
+                  type="button"
+                  className={`engine-switch-btn ${!aiMode ? 'selected-local' : ''}`}
+                  onClick={() => handleModeChange(false)}
+                  title="Run retrieval locally using system models without Groq API"
+                >
+                  <Cpu size={13} />
+                  <span>Local Non-AI</span>
+                </button>
+                <button
+                  type="button"
+                  className={`engine-switch-btn ${aiMode ? 'selected-ai' : ''}`}
+                  onClick={() => handleModeChange(true)}
+                  title="Use secret Groq API key for enhanced reasoning"
+                >
+                  <Sparkles size={13} />
+                  <span>Groq AI Mode</span>
+                </button>
               </div>
             </div>
 
@@ -528,33 +609,45 @@ export default function App() {
               <input
                 value={query}
                 onChange={e => setQuery(e.target.value)}
-                placeholder="Search dialogue, visual actions, objects, or scenes..."
+                placeholder={aiMode 
+                  ? "Search dialogue, visual actions, emotions, or scenes (Groq AI Key active)..." 
+                  : "Search dialogue or visual keywords (Running locally on system)..."}
               />
               <button className="btn-primary" style={{ padding: '8px 18px', fontSize: '13px' }} disabled={busy}>
                 <Search size={15}/> Search
               </button>
             </form>
 
-            {/* Multimodal Retrieval Workflow Display */}
+            {/* Multimodal Retrieval Workflow Display - Different for AI vs Non-AI mode */}
             {workflow.length > 0 && (
-              <div className="retrieval-workflow-card">
+              <div className={`retrieval-workflow-card ${aiMode ? 'ai-workflow-card' : 'non-ai-workflow-card'}`}>
                 <div className="workflow-card-header">
                   <div className="workflow-card-title">
-                    <Layers size={14} />
-                    <span>Multimodal Retrieval Workflow</span>
+                    {aiMode ? <Sparkles size={14} className="workflow-title-icon-ai" /> : <Layers size={14} className="workflow-title-icon-non-ai" />}
+                    <span>{aiMode ? 'AI-Assisted Neural Workflow' : 'Non-AI Deterministic Workflow'}</span>
                   </div>
-                  <span className={`workflow-mode-pill ${videoContext ? 'context-pill' : 'standard-pill'}`}>
-                    {videoContext ? 'Context-Guided' : 'Standard FAISS'}
-                  </span>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <span className={`workflow-mode-pill ${aiMode ? 'ai-pill' : 'non-ai-pill'}`}>
+                      {aiMode ? '⚡ Groq Llama-3.3 (Secret Key)' : '⚙️ Pure System FAISS (Local)'}
+                    </span>
+                    {videoContext && (
+                      <span className="workflow-mode-pill context-pill">Context-Guided</span>
+                    )}
+                  </div>
                 </div>
                 <div className="workflow-stepper">
                   {workflow.map((step, sIdx) => (
-                    <div className={`workflow-step-node ${step.active ? 'is-active' : ''}`} key={step.id || sIdx}>
-                      <div className="step-node-bubble">
+                    <div className={`workflow-step-node ${step.active ? 'is-active' : ''} ${aiMode ? 'ai-node' : 'non-ai-node'}`} key={step.id || sIdx}>
+                      <div className={`step-node-bubble ${aiMode ? 'bubble-ai' : 'bubble-non-ai'}`}>
                         <CheckCircle2 size={13} />
                       </div>
                       <div className="step-node-content">
-                        <span className="step-node-title">{step.title}</span>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                          <span className="step-node-title">{step.title}</span>
+                          {step.engine && (
+                            <span className="step-engine-tag">{step.engine}</span>
+                          )}
+                        </div>
                         <span className="step-node-detail">{step.detail}</span>
                       </div>
                     </div>
@@ -565,7 +658,9 @@ export default function App() {
 
             <div className="results-header">
               <span className="results-count">
-                {busy ? 'Running retrieval workflow...' : results.length ? `${results.length} relevant moments` : 'Moments timeline'}
+                {busy 
+                  ? (aiMode ? 'Running Groq AI reasoning workflow...' : 'Running local FAISS Euclidean search...') 
+                  : results.length ? `${results.length} relevant moments found (${aiMode ? 'AI Mode via Groq Key' : 'Non-AI Local System'})` : 'Moments timeline'}
               </span>
               <button
                 className="skeleton-toggle-btn"
@@ -597,21 +692,23 @@ export default function App() {
                   const matchPct = Math.round((result.score || (1 / (1 + result.distance))) * 100)
                   return (
                     <article
-                      className={`result ${isSelected ? 'active' : ''} ${result.is_preferred ? 'preferred-result' : ''}`}
+                      className={`result ${isSelected ? 'active' : ''} ${result.is_preferred ? (aiMode ? 'preferred-result' : 'preferred-result-non-ai') : ''}`}
                       key={`${result.timestamp}-${i}`}
                       onClick={() => seekTo(result.timestamp, result)}
                     >
                       {result.is_preferred && (
-                        <div className="preferred-banner">
-                          <div className="preferred-label">
-                            <Star size={13} fill="currentColor" />
-                            <span>Most Preferred Match</span>
+                        <div className={aiMode ? "preferred-banner" : "preferred-banner-non-ai"}>
+                          <div className={aiMode ? "preferred-label" : "preferred-label-non-ai"}>
+                            {aiMode ? <Star size={13} fill="currentColor" /> : <CheckCircle2 size={13} />}
+                            <span>{aiMode ? "AI Selected Preferred Moment" : "Top Ranked Local Vector Match"}</span>
                           </div>
-                          <span className="preferred-badge-pill">{matchPct}% Relevance</span>
+                          <span className={aiMode ? "preferred-badge-pill" : "preferred-badge-pill-non-ai"}>
+                            {aiMode ? `${matchPct}% Relevance` : `dist: ${result.distance.toFixed(3)}`}
+                          </span>
                         </div>
                       )}
 
-                      {result.ai_reasoning && (
+                      {aiMode && result.ai_reasoning && (
                         <div className="ai-reasoning-callout">
                           <Sparkles size={14} className="reasoning-sparkle" />
                           <div className="reasoning-text">
@@ -651,7 +748,9 @@ export default function App() {
                             ) : (
                               <span className="kind-badge kind-visual"><Eye size={11}/> Visual</span>
                             )}
-                            <span className="score">match {matchPct}%</span>
+                            <span className="score">
+                              {aiMode ? `match ${matchPct}%` : `similarity ${matchPct}% (L2 ${result.distance.toFixed(2)})`}
+                            </span>
                           </div>
                           <p>{result.text}</p>
                         </div>
@@ -683,7 +782,7 @@ export default function App() {
       )}
 
       <footer>
-        <span>Powered by Whisper · BLIP · FAISS · Groq</span>
+        <span>Engine: {aiMode ? 'AI Assisted (Groq Secret Key Active)' : 'Non-AI (Running Locally on System)'} · FAISS · Whisper · BLIP</span>
         <span>Secure Vision Local Studio</span>
       </footer>
 

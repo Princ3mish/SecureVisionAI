@@ -113,14 +113,15 @@ def update_settings(groq_api_key: str = Form(default="")) -> dict:
     return {"saved": True, "groq_configured": bool(cleaned)}
 
 
-def _background_worker(task_id: str, video_path: Path, interval: float, context: str = "") -> None:
+def _background_worker(task_id: str, video_path: Path, interval: float, context: str = "", ai_mode: bool = False) -> None:
     def on_progress(stage: str):
         if task_id in tasks:
             tasks[task_id]["stage"] = stage
 
     try:
-        groq_key = get_groq_api_key()
-        print(f"[_background_worker] calling process_pipeline with video_path={video_path}, interval={interval}, context={context!r}, groq_key={bool(groq_key)}")
+        # If AI mode is enabled, supply Groq API secret key; otherwise strictly use local models
+        groq_key = get_groq_api_key() if ai_mode else ""
+        print(f"[_background_worker] calling process_pipeline with video_path={video_path}, interval={interval}, context={context!r}, ai_mode={ai_mode}, groq_key_active={bool(groq_key)}")
         result = process_pipeline(
             video_path,
             DATA,
@@ -133,6 +134,7 @@ def _background_worker(task_id: str, video_path: Path, interval: float, context:
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["stage"] = "Complete"
         tasks[task_id]["result"] = result
+        tasks[task_id]["ai_mode"] = ai_mode
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -148,8 +150,9 @@ async def process_video(
     interval: float = Form(default=5.0),
     cookies: UploadFile | None = File(default=None),
     context: str = Form(default=""),
+    ai_mode: bool = Form(default=False),
 ) -> dict:
-    print(f"[process_video] video truthy={bool(video)}, video.filename={video.filename if video else None}, url={url!r}, interval={interval}, context={context!r}, VIDEO.exists={VIDEO.exists()}")
+    print(f"[process_video] video truthy={bool(video)}, url={url!r}, interval={interval}, context={context!r}, ai_mode={ai_mode}")
     if not video and not url.strip() and not VIDEO.exists():
         raise HTTPException(400, "Upload a video or provide a video URL.")
     try:
@@ -172,12 +175,13 @@ async def process_video(
             "stage": "Starting background worker...",
             "error": None,
             "result": None,
+            "ai_mode": ai_mode,
         }
 
         # Run CPU-bound processing in a separate thread so polling requests remain non-blocking
-        asyncio.create_task(asyncio.to_thread(_background_worker, task_id, VIDEO, interval, context.strip()))
+        asyncio.create_task(asyncio.to_thread(_background_worker, task_id, VIDEO, interval, context.strip(), ai_mode))
 
-        return {"task_id": task_id, "status": "processing"}
+        return {"task_id": task_id, "status": "processing", "ai_mode": ai_mode}
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
 
@@ -249,7 +253,7 @@ Return valid JSON only matching this schema:
 
 
 @app.get("/api/search")
-def search(q: str, top_k: int = 6) -> dict:
+def search(q: str, top_k: int = 6, ai_mode: bool = False) -> dict:
     if not INDEX.exists() or not DOCUMENTS.exists():
         raise HTTPException(409, "Process a video before searching.")
     try:
@@ -257,11 +261,11 @@ def search(q: str, top_k: int = 6) -> dict:
         index = faiss.read_index(str(INDEX))
         documents = json.loads(DOCUMENTS.read_text(encoding="utf-8"))
         video_context = CONTEXT.read_text(encoding="utf-8").strip() if CONTEXT.exists() else ""
-        print(f"[search] documents loaded: len(documents)={len(documents)}, index.ntotal={index.ntotal}, context={video_context!r}")
+        print(f"[search] documents loaded: len(documents)={len(documents)}, index.ntotal={index.ntotal}, context={video_context!r}, ai_mode={ai_mode}")
 
-        # Compute query vector; if context is available, compute fused contextual embedding
+        # Compute query vector; if context is available and in AI mode, compute fused contextual embedding
         raw_vector = model.encode([q], convert_to_numpy=True).astype(np.float32)
-        if video_context:
+        if ai_mode and video_context:
             context_vector = model.encode([f"{video_context}. {q}"], convert_to_numpy=True).astype(np.float32)
             vector = 0.65 * raw_vector + 0.35 * context_vector
             vector = vector / np.linalg.norm(vector, axis=1, keepdims=True)
@@ -270,7 +274,7 @@ def search(q: str, top_k: int = 6) -> dict:
 
         k = min(top_k, index.ntotal)
         if k <= 0:
-            return {"query": q, "results": [], "context": video_context, "workflow": []}
+            return {"query": q, "results": [], "context": video_context, "workflow": [], "ai_mode": ai_mode}
 
         distances, indices = index.search(vector, k)
         results = []
@@ -298,12 +302,12 @@ def search(q: str, top_k: int = 6) -> dict:
                 "is_preferred": (rank == 0),
             })
 
-        # Check for Groq Reasoning
-        groq_key = get_groq_api_key()
+        # AI-Assisted mode: use Groq secret key from .env for reasoning & reranking
+        groq_key = get_groq_api_key() if ai_mode else ""
         ai_reasoning = ""
         groq_active = False
 
-        if groq_key and len(results) > 1:
+        if ai_mode and groq_key and len(results) > 1:
             reasoning_data = groq_reason_and_rerank(q, video_context, results, groq_key)
             if reasoning_data and "best_index" in reasoning_data:
                 groq_active = True
@@ -319,40 +323,78 @@ def search(q: str, top_k: int = 6) -> dict:
                 if ai_reasoning:
                     results[0]["ai_reasoning"] = ai_reasoning
 
-        workflow_steps = [
-            {
-                "id": "query_proc",
-                "title": "Contextual Query Fusion",
-                "detail": f"Fused query '{q}' with video context: \"{video_context}\"" if video_context else f"Encoded raw query '{q}' with all-MiniLM-L6-v2",
-                "active": bool(video_context),
-            },
-            {
-                "id": "index_scan",
-                "title": "Multimodal Vector Retrieval",
-                "detail": f"Queried FAISS index across {index.ntotal} visual & speech embeddings",
-                "active": True,
-            },
-            {
-                "id": "rerank",
-                "title": "LLM Semantic Reasoning (Groq Llama-3.3)" if groq_active else "Semantic Relevance Scoring",
-                "detail": f"Reasoned: {ai_reasoning}" if ai_reasoning else "Calculated cosine proximity & prioritized context-aligned visual moments",
-                "active": True,
-            },
-            {
-                "id": "preferred",
-                "title": "Preferred Moment Selection",
-                "detail": f"Rank #1 pinpointed as target moment ({int(results[0]['score'] * 100)}% match)" if results else "No matches found",
-                "active": True,
-            },
-        ]
+        # Build workflow steps — clearly distinct between AI mode and Non-AI mode
+        if ai_mode:
+            workflow_steps = [
+                {
+                    "id": "query_proc",
+                    "title": "Contextual Query Fusion",
+                    "detail": f"Fused query '{q}' with video context: \"{video_context}\"" if video_context else f"Contextual query vector generated for '{q}'",
+                    "active": True,
+                    "engine": "AI Neural",
+                },
+                {
+                    "id": "index_scan",
+                    "title": "Multimodal Vector Retrieval",
+                    "detail": f"Queried FAISS multimodal index across {index.ntotal} visual & speech embeddings",
+                    "active": True,
+                    "engine": "FAISS",
+                },
+                {
+                    "id": "rerank",
+                    "title": "Groq LLM Semantic Reasoning" if groq_active else "Semantic Similarity Scoring",
+                    "detail": f"Groq Llama-3.3 evaluated: {ai_reasoning}" if ai_reasoning else "Semantic relevance evaluated across top candidate moments using Groq secret key",
+                    "active": True,
+                    "engine": "Groq Llama-3.3" if groq_active else "Transformer",
+                },
+                {
+                    "id": "preferred",
+                    "title": "AI Preferred Target Pinpointing",
+                    "detail": f"Rank #1 identified as primary moment ({int(results[0]['score'] * 100)}% match)" if results else "No matches found",
+                    "active": True,
+                    "engine": "Reasoning Core",
+                },
+            ]
+        else:
+            workflow_steps = [
+                {
+                    "id": "query_proc",
+                    "title": "Direct Text Tokenization",
+                    "detail": f"Directly encoded query string '{q}' via Sentence-Transformer without Groq API call",
+                    "active": True,
+                    "engine": "Local MiniLM-L6",
+                },
+                {
+                    "id": "index_scan",
+                    "title": "Deterministic FAISS L2 Search",
+                    "detail": f"Exhaustive L2 Euclidean distance vector comparison against {index.ntotal} records",
+                    "active": True,
+                    "engine": "Local FAISS FlatL2",
+                },
+                {
+                    "id": "scoring",
+                    "title": "Raw Mathematical Distance Ranking",
+                    "detail": "Strict mathematical proximity sort (1/(1+dist)) — zero Groq API calls or cloud inference",
+                    "active": True,
+                    "engine": "Local Float Sort",
+                },
+                {
+                    "id": "preferred",
+                    "title": "Euclidean Nearest-Neighbor Selection",
+                    "detail": f"Selected closest geometric vector at {results[0]['timestamp']:.1f}s (distance: {results[0]['distance']:.3f})" if results else "No matches found",
+                    "active": True,
+                    "engine": "Nearest Vector",
+                },
+            ]
 
-        print(f"[search] returning len(results)={len(results)}, context_active={bool(video_context)}, groq_active={groq_active}")
+        print(f"[search] returning len(results)={len(results)}, context_active={bool(video_context)}, groq_active={groq_active}, ai_mode={ai_mode}")
         return {
             "query": q,
             "context": video_context,
             "results": results,
             "workflow": workflow_steps,
             "groq_active": groq_active,
+            "ai_mode": ai_mode,
         }
     except Exception as exc:
         import traceback
